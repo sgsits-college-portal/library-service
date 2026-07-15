@@ -41,7 +41,7 @@ public class LibraryController {
     }
 
     // Helper method to validate student/teacher/faculty role and credentials
-    private User validateStudent(String roleHeader, Long idHeader) {
+    private User validateStudent(String roleHeader, String idHeaderStr) {
         if (roleHeader == null) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied. Role header required.");
         }
@@ -49,13 +49,25 @@ public class LibraryController {
         if (!"STUDENT".equals(cleanRole) && !"TEACHER".equals(cleanRole) && !"FACULTY".equals(cleanRole) && !"HEAD".equals(cleanRole)) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied. Student/Faculty role required.");
         }
-        if (idHeader == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing X-User-Id header.");
+        if (idHeaderStr == null || idHeaderStr.trim().isEmpty() || "null".equalsIgnoreCase(idHeaderStr.trim())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing or invalid X-User-Id header.");
         }
         
         syncUsersFromAuthService();
 
-        return userRepository.findById(idHeader)
+        try {
+            Long id = Long.parseLong(idHeaderStr.trim());
+            java.util.Optional<User> u = userRepository.findById(id);
+            if (u.isPresent()) return u.get();
+        } catch (NumberFormatException e) {
+            // Ignore, try lookup by username/email
+        }
+
+        // Look up by username or email
+        return userRepository.findByUsername(idHeaderStr.trim())
+                .or(() -> userRepository.findAll().stream()
+                        .filter(u -> idHeaderStr.trim().equalsIgnoreCase(u.getEmail()))
+                        .findFirst())
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED, "User not found."));
     }
 
@@ -105,6 +117,13 @@ public class LibraryController {
                                 localUser.setEmail(email);
                                 userRepository.save(localUser);
                             } else {
+                                // Check if user with same username exists with a different ID to avoid constraint violation
+                                java.util.Optional<User> byUsernameOpt = userRepository.findByUsername(username.trim());
+                                if (byUsernameOpt.isPresent()) {
+                                    userRepository.delete(byUsernameOpt.get());
+                                    userRepository.flush();
+                                }
+                                
                                 User newUser = new User();
                                 newUser.setId(id);
                                 newUser.setUsername(username);
@@ -127,7 +146,7 @@ public class LibraryController {
     @GetMapping("/student/books")
     public ResponseEntity<List<Book>> getBooksForStudent(
             @RequestHeader(value = "X-User-Role", required = false) String role,
-            @RequestHeader(value = "X-User-Id", required = false) Long userId,
+            @RequestHeader(value = "X-User-Id", required = false) String userId,
             @RequestParam(value = "search", required = false) String search) {
         validateStudent(role, userId);
 
@@ -143,7 +162,7 @@ public class LibraryController {
     @GetMapping("/student/dashboard")
     public ResponseEntity<StudentDashboardDto> getStudentDashboard(
             @RequestHeader(value = "X-User-Role", required = false) String role,
-            @RequestHeader(value = "X-User-Id", required = false) Long userId,
+            @RequestHeader(value = "X-User-Id", required = false) String userId,
             @RequestParam(value = "simulatedDate", required = false) String simulatedDateStr) {
         User student = validateStudent(role, userId);
 
@@ -435,6 +454,7 @@ public class LibraryController {
 
     @PostMapping("/users/login")
     public ResponseEntity<User> login(@RequestParam String username, @RequestParam String role) {
+        syncUsersFromAuthService();
         java.util.Optional<User> existing = userRepository.findByUsername(username.trim());
         if (existing.isPresent()) {
             User user = existing.get();
