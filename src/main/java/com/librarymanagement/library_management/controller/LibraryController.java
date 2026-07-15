@@ -4,12 +4,16 @@ import com.librarymanagement.library_management.dto.IssuedBookDetailDto;
 import com.librarymanagement.library_management.dto.StudentDashboardDto;
 import com.librarymanagement.library_management.model.Book;
 import com.librarymanagement.library_management.model.BookIssue;
+import com.librarymanagement.library_management.model.User;
 import com.librarymanagement.library_management.repository.BookIssueRepository;
 import com.librarymanagement.library_management.repository.BookRepository;
+import com.librarymanagement.library_management.repository.UserRepository;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
+
+import org.springframework.web.client.RestTemplate;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
@@ -24,23 +28,47 @@ import java.util.Map;
 @CrossOrigin(origins = "*", allowedHeaders = "*")
 public class LibraryController {
 
+    private final UserRepository userRepository;
     private final BookRepository bookRepository;
     private final BookIssueRepository bookIssueRepository;
 
-    public LibraryController(BookRepository bookRepository,
+    public LibraryController(UserRepository userRepository,
+            BookRepository bookRepository,
             BookIssueRepository bookIssueRepository) {
+        this.userRepository = userRepository;
         this.bookRepository = bookRepository;
         this.bookIssueRepository = bookIssueRepository;
     }
 
-    // Helper method to validate student/teacher role and credentials
-    private void validateStudent(String roleHeader, Long idHeader) {
-        if (roleHeader == null || (!"STUDENT".equalsIgnoreCase(roleHeader.trim()) && !"TEACHER".equalsIgnoreCase(roleHeader.trim()))) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied. Student/Teacher role required.");
+    // Helper method to validate student/teacher/faculty role and credentials
+    private User validateStudent(String roleHeader, String idHeaderStr) {
+        if (roleHeader == null) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied. Role header required.");
         }
-        if (idHeader == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing X-User-Id header.");
+        String cleanRole = roleHeader.trim().toUpperCase();
+        if (!"STUDENT".equals(cleanRole) && !"TEACHER".equals(cleanRole) && !"FACULTY".equals(cleanRole) && !"HEAD".equals(cleanRole)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied. Student/Faculty role required.");
         }
+        if (idHeaderStr == null || idHeaderStr.trim().isEmpty() || "null".equalsIgnoreCase(idHeaderStr.trim())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing or invalid X-User-Id header.");
+        }
+        
+        syncUsersFromAuthService();
+
+        try {
+            Long id = Long.parseLong(idHeaderStr.trim());
+            java.util.Optional<User> u = userRepository.findById(id);
+            if (u.isPresent()) return u.get();
+        } catch (NumberFormatException e) {
+            // Ignore, try lookup by username/email
+        }
+
+        // Look up by username or email
+        return userRepository.findByUsername(idHeaderStr.trim())
+                .or(() -> userRepository.findAll().stream()
+                        .filter(u -> idHeaderStr.trim().equalsIgnoreCase(u.getEmail()))
+                        .findFirst())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED, "User not found."));
     }
 
     // Helper method to validate librarian role
@@ -50,12 +78,75 @@ public class LibraryController {
         }
     }
 
+    private void syncUsersFromAuthService() {
+        RestTemplate restTemplate = new RestTemplate();
+        try {
+            String url = "http://localhost:8080/api/auth/users";
+            List<?> usersList = restTemplate.getForObject(url, List.class);
+            if (usersList != null) {
+                for (Object item : usersList) {
+                    if (item instanceof Map) {
+                        Map<?, ?> u = (Map<?, ?>) item;
+                        Long id = ((Number) u.get("id")).longValue();
+                        String username = (String) u.get("username");
+                        String role = (String) u.get("role");
+                        String subRole = (String) u.get("subRole");
+                        String fullName = (String) u.get("fullName");
+                        String email = (String) u.get("email");
+                        
+                        String r = role != null ? role.toUpperCase().trim() : "";
+                        String sr = subRole != null ? subRole.toUpperCase().trim() : "";
+                        
+                        boolean isLibraryUser = "STUDENT".equals(r) || "FACULTY".equals(r) || "HEAD".equals(r) || "ADMIN".equals(r) || 
+                                               ("STAFF".equals(r) && "LIBRARIAN".equals(sr));
+                        
+                        if (isLibraryUser) {
+                            String libraryRole = "STUDENT";
+                            if ("ADMIN".equals(r) || ("STAFF".equals(r) && "LIBRARIAN".equals(sr))) {
+                                libraryRole = "LIBRARIAN";
+                            } else if ("FACULTY".equals(r) || "HEAD".equals(r)) {
+                                libraryRole = "FACULTY";
+                            }
+                            
+                            java.util.Optional<User> localUserOpt = userRepository.findById(id);
+                            if (localUserOpt.isPresent()) {
+                                User localUser = localUserOpt.get();
+                                localUser.setUsername(username);
+                                localUser.setRole(libraryRole);
+                                localUser.setName(fullName != null ? fullName : username);
+                                localUser.setEmail(email);
+                                userRepository.save(localUser);
+                            } else {
+                                // Check if user with same username exists with a different ID to avoid constraint violation
+                                java.util.Optional<User> byUsernameOpt = userRepository.findByUsername(username.trim());
+                                if (byUsernameOpt.isPresent()) {
+                                    userRepository.delete(byUsernameOpt.get());
+                                    userRepository.flush();
+                                }
+                                
+                                User newUser = new User();
+                                newUser.setId(id);
+                                newUser.setUsername(username);
+                                newUser.setRole(libraryRole);
+                                newUser.setName(fullName != null ? fullName : username);
+                                newUser.setEmail(email);
+                                userRepository.save(newUser);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Failed to sync users from auth-service: " + e.getMessage());
+        }
+    }
+
     // STUDENT ENDPOINTS
 
     @GetMapping("/student/books")
     public ResponseEntity<List<Book>> getBooksForStudent(
             @RequestHeader(value = "X-User-Role", required = false) String role,
-            @RequestHeader(value = "X-User-Id", required = false) Long userId,
+            @RequestHeader(value = "X-User-Id", required = false) String userId,
             @RequestParam(value = "search", required = false) String search) {
         validateStudent(role, userId);
 
@@ -71,9 +162,9 @@ public class LibraryController {
     @GetMapping("/student/dashboard")
     public ResponseEntity<StudentDashboardDto> getStudentDashboard(
             @RequestHeader(value = "X-User-Role", required = false) String role,
-            @RequestHeader(value = "X-User-Id", required = false) Long userId,
+            @RequestHeader(value = "X-User-Id", required = false) String userId,
             @RequestParam(value = "simulatedDate", required = false) String simulatedDateStr) {
-        validateStudent(role, userId);
+        User student = validateStudent(role, userId);
 
         LocalDate referenceDate = LocalDate.now();
         if (simulatedDateStr != null && !simulatedDateStr.trim().isEmpty()) {
@@ -85,7 +176,7 @@ public class LibraryController {
             }
         }
 
-        List<BookIssue> activeIssues = bookIssueRepository.findByStudentIdAndReturnDateIsNull(userId);
+        List<BookIssue> activeIssues = bookIssueRepository.findByStudentIdAndReturnDateIsNull(student.getId());
         List<IssuedBookDetailDto> issuedBookDetails = new ArrayList<>();
         double totalFine = 0.0;
 
@@ -114,7 +205,8 @@ public class LibraryController {
         }
 
         StudentDashboardDto dashboard = new StudentDashboardDto(
-                userId,
+                student.getId(),
+                student.getUsername(),
                 activeIssues.size(),
                 totalFine,
                 issuedBookDetails);
@@ -136,6 +228,16 @@ public class LibraryController {
             @RequestParam Long studentId,
             @RequestParam Long bookId) {
         validateLibrarian(role);
+
+        User student = userRepository.findById(studentId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Student not found."));
+
+        if (!"STUDENT".equalsIgnoreCase(student.getRole()) && 
+            !"TEACHER".equalsIgnoreCase(student.getRole()) && 
+            !"FACULTY".equalsIgnoreCase(student.getRole()) && 
+            !"HEAD".equalsIgnoreCase(student.getRole())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "User must be a student or a faculty member.");
+        }
 
         Book book = bookRepository.findById(bookId)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Book not found."));
@@ -159,7 +261,7 @@ public class LibraryController {
         LocalDate today = LocalDate.now();
         LocalDate dueDate = today.plusDays(30); // 30-day default issue duration
 
-        BookIssue issue = new BookIssue(bookId, studentId, today, dueDate);
+        BookIssue issue = new BookIssue(bookId, student.getId(), today, dueDate);
         BookIssue savedIssue = bookIssueRepository.save(issue);
         return ResponseEntity.status(HttpStatus.CREATED).body(savedIssue);
     }
@@ -169,46 +271,59 @@ public class LibraryController {
             @RequestHeader(value = "X-User-Role", required = false) String role,
             @RequestParam Long studentId,
             @RequestParam Long bookId) {
-        validateLibrarian(role);
+        try {
+            validateLibrarian(role);
 
-        BookIssue issue = bookIssueRepository.findByBookIdAndStudentIdAndReturnDateIsNull(bookId, studentId)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                        "No active issue record found for this book and student."));
+            User student = userRepository.findById(studentId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Student not found."));
 
-        Book book = bookRepository.findById(bookId)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Book not found."));
+            List<BookIssue> issues = bookIssueRepository.findByBookIdAndStudentIdAndReturnDateIsNull(bookId, student.getId());
+            if (issues.isEmpty()) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "No active issue record found for this book and student.");
+            }
+            BookIssue issue = issues.get(0);
 
-        LocalDate today = LocalDate.now();
-        issue.setReturnDate(today);
-        bookIssueRepository.save(issue);
+            Book book = bookRepository.findById(bookId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Book not found."));
 
-        if (book.getAvailableCopies() == null) {
-            book.setAvailableCopies(book.isAvailable() ? 1 : 0);
+            LocalDate today = LocalDate.now();
+            issue.setReturnDate(today);
+            bookIssueRepository.save(issue);
+
+            if (book.getAvailableCopies() == null) {
+                book.setAvailableCopies(book.isAvailable() ? 1 : 0);
+            }
+            book.setAvailableCopies(book.getAvailableCopies() + 1);
+            book.setAvailable(true);
+            book.setTag("AVAILABLE");
+            bookRepository.save(book);
+
+            // Fine details: 1 rupee for each day after deadline
+            long daysOverdue = 0;
+            double fine = 0.0;
+            if (today.isAfter(issue.getDueDate())) {
+                daysOverdue = ChronoUnit.DAYS.between(issue.getDueDate(), today);
+                fine = daysOverdue * 1.0;
+            }
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("message", "Book returned successfully");
+            response.put("bookId", book.getId());
+            response.put("studentId", student.getId());
+            response.put("title", book.getTitle());
+            response.put("returnDate", today);
+            response.put("dueDate", issue.getDueDate());
+            response.put("daysOverdue", daysOverdue);
+            response.put("fineAmount", fine);
+
+            return ResponseEntity.ok(response);
+        } catch (ResponseStatusException e) {
+            throw e;
+        } catch (Exception e) {
+            e.printStackTrace();
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Error returning book: " + e.getMessage(), e);
         }
-        book.setAvailableCopies(book.getAvailableCopies() + 1);
-        book.setAvailable(true);
-        book.setTag("AVAILABLE");
-        bookRepository.save(book);
-
-        // Fine details: 1 rupee for each day after deadline
-        long daysOverdue = 0;
-        double fine = 0.0;
-        if (today.isAfter(issue.getDueDate())) {
-            daysOverdue = ChronoUnit.DAYS.between(issue.getDueDate(), today);
-            fine = daysOverdue * 1.0;
-        }
-
-        Map<String, Object> response = new HashMap<>();
-        response.put("message", "Book returned successfully");
-        response.put("bookId", book.getId());
-        response.put("studentId", studentId);
-        response.put("title", book.getTitle());
-        response.put("returnDate", today);
-        response.put("dueDate", issue.getDueDate());
-        response.put("daysOverdue", daysOverdue);
-        response.put("fineAmount", fine);
-
-        return ResponseEntity.ok(response);
     }
 
     @GetMapping("/librarian/books")
@@ -335,5 +450,86 @@ public class LibraryController {
 
         Book updatedBook = bookRepository.save(book);
         return ResponseEntity.ok(updatedBook);
+    }
+
+    @PostMapping("/users/login")
+    public ResponseEntity<User> login(@RequestParam String username, @RequestParam String role) {
+        syncUsersFromAuthService();
+        java.util.Optional<User> existing = userRepository.findByUsername(username.trim());
+        if (existing.isPresent()) {
+            User user = existing.get();
+            if (user.getRole().equalsIgnoreCase(role.trim())) {
+                return ResponseEntity.ok(user);
+            } else {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Role mismatch");
+            }
+        }
+        throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "User not found.");
+    }
+
+    @GetMapping("/librarian/users")
+    public ResponseEntity<List<User>> getAllUsers(@RequestHeader(value = "X-User-Role", required = false) String role) {
+        validateLibrarian(role);
+        syncUsersFromAuthService();
+        return ResponseEntity.ok(userRepository.findAll());
+    }
+
+    @PostMapping("/librarian/users")
+    public ResponseEntity<User> createUser(
+            @RequestHeader(value = "X-User-Role", required = false) String roleHeader,
+            @RequestBody User user) {
+        validateLibrarian(roleHeader);
+
+        if (user.getUsername() == null || user.getUsername().trim().isEmpty() ||
+                user.getRole() == null || user.getRole().trim().isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Username and role are required.");
+        }
+
+        if (userRepository.findByUsername(user.getUsername().trim()).isPresent()) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "A user with the same username already exists.");
+        }
+
+        User newUser = new User(user.getUsername().trim(), user.getRole().toUpperCase().trim());
+        newUser.setId(System.currentTimeMillis() % 100000000L);
+        newUser.setName(user.getName() != null ? user.getName().trim() : user.getUsername().trim());
+        
+        // Generate email if not explicitly provided or formatted
+        if (user.getEmail() == null || user.getEmail().trim().isEmpty()) {
+            if ("STUDENT".equalsIgnoreCase(newUser.getRole())) {
+                newUser.setEmail(newUser.getUsername().toLowerCase() + "@sgsits.ac.in");
+            } else {
+                String nameLower = newUser.getName().toLowerCase().replace(" ", "_");
+                newUser.setEmail(nameLower + "@sgsits.ac.in");
+            }
+        } else {
+            newUser.setEmail(user.getEmail().trim());
+        }
+
+        User savedUser = userRepository.save(newUser);
+        return ResponseEntity.status(HttpStatus.CREATED).body(savedUser);
+    }
+
+    @DeleteMapping("/librarian/users/{id}")
+    public ResponseEntity<Void> deleteUser(
+            @RequestHeader(value = "X-User-Role", required = false) String roleHeader,
+            @PathVariable Long id) {
+        validateLibrarian(roleHeader);
+
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found."));
+
+        // Clean up issues for this deleted student/member
+        List<BookIssue> issues = bookIssueRepository.findByStudentIdAndReturnDateIsNull(id);
+        for (BookIssue issue : issues) {
+            bookRepository.findById(issue.getBookId()).ifPresent(b -> {
+                b.setAvailable(true);
+                b.setTag("AVAILABLE");
+                bookRepository.save(b);
+            });
+        }
+        bookIssueRepository.deleteAll(issues);
+
+        userRepository.delete(user);
+        return ResponseEntity.noContent().build();
     }
 }
