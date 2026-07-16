@@ -80,7 +80,7 @@ public class LibraryController {
     private void syncUsersFromAuthService() {
         RestTemplate restTemplate = new RestTemplate();
         try {
-            String url = "http://localhost:8080/api/auth/users";
+            String url = "https://gateway-service-sc5r.onrender.com/api/auth/users";
             List<?> usersList = restTemplate.getForObject(url, List.class);
             if (usersList != null) {
                 for (Object item : usersList) {
