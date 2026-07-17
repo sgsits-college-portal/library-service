@@ -67,7 +67,15 @@ public class LibraryController {
                 .or(() -> userRepository.findAll().stream()
                         .filter(u -> idHeaderStr.trim().equalsIgnoreCase(u.getEmail()))
                         .findFirst())
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED, "User not found."));
+                .orElseGet(() -> {
+                     User newUser = new User();
+                     newUser.setId(System.currentTimeMillis() % 100000000L);
+                     newUser.setUsername(idHeaderStr.trim());
+                     newUser.setRole(cleanRole);
+                     newUser.setName(idHeaderStr.trim());
+                     newUser.setEmail(idHeaderStr.trim().toLowerCase() + "@sgsits.ac.in");
+                     return userRepository.save(newUser);
+                });
     }
 
     // Helper method to validate librarian role
